@@ -1,7 +1,7 @@
 # Windows Setup
 ## Short version
 
-On Windows, follow the standard [README.md](./README.md), but to set API key do one of:
+On Windows, follow the standard [README.md](https://github.com/gpt-engineer-org/gpt-engineer/blob/main/README.md), but to set API key do one of:
 - `set OPENAI_API_KEY=[your api key]` on cmd
 - `$env:OPENAI_API_KEY="[your api key]"` on powershell
 
@@ -27,10 +27,10 @@ Or:
 
 For **development**:
 
-- `git clone git@github.com:AntonOsika/gpt-engineer.git`
+- `git clone git@github.com:gpt-engineer-org/gpt-engineer.git`
 - `cd gpt-engineer`
-- `pip install -e .`
-  - (or: `make install && source venv/bin/activate` for a venv)
+- `poetry install`
+- `poetry shell` to activate the virtual environment
 
 ### Setup
 
@@ -61,7 +61,7 @@ Now you can use `%OPENAI_API_KEY%` when prompted to input your key.
 - `gpt-engineer projects/my-new-project`
   - (Note, `gpt-engineer --help` lets you see all available options. For example `--steps use_feedback` lets you improve/fix code in a project)
 
-By running gpt-engineer you agree to our [ToS](https://github.com/AntonOsika/gpt-engineer/blob/main/TERMS_OF_USE.md).
+By running gpt-engineer you agree to our [ToS](https://github.com/gpt-engineer-org/gpt-engineer/blob/main/TERMS_OF_USE.md).
 
 ### Results
 

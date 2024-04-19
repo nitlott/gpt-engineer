@@ -1,5 +1,1 @@
-gpt_engineer/steps.py @pbharrin
-gpt_engineer/chat_to_files.py @RareMojo
-gpt_engineer/db.py @RareMojo
-evals/ @UmerHA
 .github/workflows/ @ATheorell

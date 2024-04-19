@@ -1,24 +1,16 @@
 """
-This module provides an interface to interact with AI models.
-It leverages the OpenAI GPT models and allows for integration with Azure-based instances of the same.
-The AI class encapsulates the chat functionalities, allowing to start, advance, and manage a conversation with the model.
+AI Module
 
-Key Features:
-- Integration with Azure-based OpenAI instances through the LangChain AzureChatOpenAI class.
-- Token usage logging to monitor the number of tokens consumed during a conversation.
-- Seamless fallback to default models in case the desired model is unavailable.
-- Serialization and deserialization of chat messages for easier transmission and storage.
+This module provides an AI class that interfaces with language models to perform various tasks such as
+starting a conversation, advancing the conversation, and handling message serialization. It also includes
+backoff strategies for handling rate limit errors from the OpenAI API.
 
 Classes:
-- AI: Main class providing chat functionalities.
+    AI: A class that interfaces with language models for conversation management and message serialization.
 
-Dependencies:
-- langchain: For chat models and message schemas.
-- openai: For the core GPT models interaction.
-- backoff: For handling rate limits and retries.
-- typing: For type hints.
-
-For more specific details, refer to the docstrings within each class and function.
+Functions:
+    serialize_messages(messages: List[Message]) -> str
+        Serialize a list of messages to a JSON string.
 """
 
 from __future__ import annotations
@@ -27,15 +19,14 @@ import json
 import logging
 import os
 
-from typing import List, Optional, Union
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 import backoff
 import openai
-
-from gpt_engineer.core.token_usage import TokenUsageLog
+import pyperclip
 
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.chat_models import AzureChatOpenAI, ChatOpenAI
 from langchain.chat_models.base import BaseChatModel
 from langchain.schema import (
     AIMessage,
@@ -44,6 +35,10 @@ from langchain.schema import (
     messages_from_dict,
     messages_to_dict,
 )
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+from gpt_engineer.core.token_usage import TokenUsageLog
 
 # Type hint for a chat message
 Message = Union[AIMessage, HumanMessage, SystemMessage]
@@ -54,42 +49,50 @@ logger = logging.getLogger(__name__)
 
 class AI:
     """
-    A class to interface with a language model for chat-based interactions.
+    A class that interfaces with language models for conversation management and message serialization.
 
-    This class provides methods to initiate and maintain conversations using
-    a specified language model. It handles token counting, message creation,
-    serialization and deserialization of chat messages, and interfaces with
-    the language model to get AI-generated responses.
+    This class provides methods to start and advance conversations, handle message serialization,
+    and implement backoff strategies for rate limit errors when interacting with the OpenAI API.
 
     Attributes
     ----------
     temperature : float
-        The temperature setting for the model, affecting the randomness of the output.
+        The temperature setting for the language model.
     azure_endpoint : str
-        The Azure endpoint URL, if applicable.
+        The endpoint URL for the Azure-hosted language model.
     model_name : str
-        The name of the model being used.
-    llm : Any
-        The chat model instance.
-    token_usage_log : Any
-        The token usage log used to store cumulitive tokens used during the lifetime of the ai class
+        The name of the language model to use.
+    streaming : bool
+        A flag indicating whether to use streaming for the language model.
+    llm : BaseChatModel
+        The language model instance for conversation management.
+    token_usage_log : TokenUsageLog
+        A log for tracking token usage during conversations.
 
     Methods
     -------
-    start(system, user, step_name) -> List[Message]:
-        Start the conversation with a system and user message.
-    next(messages, prompt, step_name) -> List[Message]:
-        Advance the conversation by interacting with the language model.
-    backoff_inference(messages, callbacks) -> Any:
-        Interact with the model using an exponential backoff strategy in case of rate limits.
-    serialize_messages(messages) -> str:
+    start(system: str, user: str, step_name: str) -> List[Message]
+        Start the conversation with a system message and a user message.
+    next(messages: List[Message], prompt: Optional[str], step_name: str) -> List[Message]
+        Advances the conversation by sending message history to LLM and updating with the response.
+    backoff_inference(messages: List[Message]) -> Any
+        Perform inference using the language model with an exponential backoff strategy.
+    serialize_messages(messages: List[Message]) -> str
         Serialize a list of messages to a JSON string.
-    deserialize_messages(jsondictstr) -> List[Message]:
-        Deserialize a JSON string into a list of messages.
-
+    deserialize_messages(jsondictstr: str) -> List[Message]
+        Deserialize a JSON string to a list of messages.
+    _create_chat_model() -> BaseChatModel
+        Create a chat model with the specified model name and temperature.
     """
 
-    def __init__(self, model_name="gpt-4", temperature=0.1, azure_endpoint=""):
+    def __init__(
+        self,
+        model_name="gpt-4-turbo",
+        temperature=0.1,
+        azure_endpoint=None,
+        streaming=True,
+        vision=False,
+    ):
         """
         Initialize the AI class.
 
@@ -102,14 +105,19 @@ class AI:
         """
         self.temperature = temperature
         self.azure_endpoint = azure_endpoint
-        self.model_name = self._check_model_access_and_fallback(model_name)
-
+        self.model_name = model_name
+        self.streaming = streaming
+        self.vision = (
+            ("vision-preview" in model_name)
+            or ("gpt-4-turbo" in model_name and "preview" not in model_name)
+            or ("claude" in model_name)
+        )
         self.llm = self._create_chat_model()
         self.token_usage_log = TokenUsageLog(model_name)
 
         logger.debug(f"Using model {self.model_name}")
 
-    def start(self, system: str, user: str, step_name: str) -> List[Message]:
+    def start(self, system: str, user: Any, *, step_name: str) -> List[Message]:
         """
         Start the conversation with a system message and a user message.
 
@@ -133,6 +141,67 @@ class AI:
             HumanMessage(content=user),
         ]
         return self.next(messages, step_name=step_name)
+
+    def _extract_content(self, content):
+        """
+        Extracts text content from a message, supporting both string and list types.
+        Parameters
+        ----------
+        content : Union[str, List[dict]]
+            The content of a message, which could be a string or a list.
+        Returns
+        -------
+        str
+            The extracted text content.
+        """
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list) and content and "text" in content[0]:
+            # Assuming the structure of list content is [{'type': 'text', 'text': 'Some text'}, ...]
+            return content[0]["text"]
+        else:
+            return ""
+
+    def _collapse_text_messages(self, messages: List[Message]):
+        """
+        Combine consecutive messages of the same type into a single message, where if the message content
+        is a list type, the first text element's content is taken. This method keeps `combined_content` as a string.
+
+        This method iterates through the list of messages, combining consecutive messages of the same type
+        by joining their content with a newline character. If the content is a list, it extracts text from the first
+        text element's content. This reduces the number of messages and simplifies the conversation for processing.
+
+        Parameters
+        ----------
+        messages : List[Message]
+            The list of messages to collapse.
+
+        Returns
+        -------
+        List[Message]
+            The list of messages after collapsing consecutive messages of the same type.
+        """
+        collapsed_messages = []
+        if not messages:
+            return collapsed_messages
+
+        previous_message = messages[0]
+        combined_content = self._extract_content(previous_message.content)
+
+        for current_message in messages[1:]:
+            if current_message.type == previous_message.type:
+                combined_content += "\n\n" + self._extract_content(
+                    current_message.content
+                )
+            else:
+                collapsed_messages.append(
+                    previous_message.__class__(content=combined_content)
+                )
+                previous_message = current_message
+                combined_content = self._extract_content(current_message.content)
+
+        collapsed_messages.append(previous_message.__class__(content=combined_content))
+        return collapsed_messages
 
     def next(
         self,
@@ -159,17 +228,19 @@ class AI:
         List[Message]
             The updated list of messages in the conversation.
         """
-        """
-        Advances the conversation by sending message history
-        to LLM and updating with the response.
-        """
+
         if prompt:
             messages.append(HumanMessage(content=prompt))
 
-        logger.debug(f"Creating a new chat completion: {messages}")
+        logger.debug(
+            "Creating a new chat completion: %s",
+            "\n".join([m.pretty_repr() for m in messages]),
+        )
 
-        callbacks = [StreamingStdOutCallbackHandler()]
-        response = self.backoff_inference(messages, callbacks)
+        if not self.vision:
+            messages = self._collapse_text_messages(messages)
+
+        response = self.backoff_inference(messages)
 
         self.token_usage_log.update_log(
             messages=messages, answer=response.content, step_name=step_name
@@ -179,10 +250,8 @@ class AI:
 
         return messages
 
-    @backoff.on_exception(
-        backoff.expo, openai.error.RateLimitError, max_tries=7, max_time=45
-    )
-    def backoff_inference(self, messages, callbacks):
+    @backoff.on_exception(backoff.expo, openai.RateLimitError, max_tries=7, max_time=45)
+    def backoff_inference(self, messages):
         """
         Perform inference using the language model while implementing an exponential backoff strategy.
 
@@ -213,10 +282,9 @@ class AI:
         Example
         -------
         >>> messages = [SystemMessage(content="Hello"), HumanMessage(content="How's the weather?")]
-        >>> callbacks = [some_logging_callback]
-        >>> response = backoff_inference(messages, callbacks)
+        >>> response = backoff_inference(messages)
         """
-        return self.llm(messages, callbacks=callbacks)  # type: ignore
+        return self.llm.invoke(messages)  # type: ignore
 
     @staticmethod
     def serialize_messages(messages: List[Message]) -> str:
@@ -254,35 +322,10 @@ class AI:
         # Modify implicit is_chunk property to ALWAYS false
         # since Langchain's Message schema is stricter
         prevalidated_data = [
-            {**item, "data": {**item["data"], "is_chunk": False}} for item in data
+            {**item, "tools": {**item.get("tools", {}), "is_chunk": False}}
+            for item in data
         ]
         return list(messages_from_dict(prevalidated_data))  # type: ignore
-
-    def _check_model_access_and_fallback(self, model_name) -> str:
-        """
-        Retrieve the specified model, or fallback to "gpt-3.5-turbo" if the model is not available.
-
-        Parameters
-        ----------
-        model : str
-            The name of the model to retrieve.
-
-        Returns
-        -------
-        str
-            The name of the retrieved model, or "gpt-3.5-turbo" if the specified model is not available.
-        """
-        try:
-            openai.Model.retrieve(model_name)
-        except openai.InvalidRequestError:
-            print(
-                f"Model {model_name} not available for provided API key. Reverting "
-                "to gpt-3.5-turbo. Sign up for the GPT-4 wait list here: "
-                "https://openai.com/waitlist/gpt-4-api\n"
-            )
-            return "gpt-3.5-turbo"
-
-        return model_name
 
     def _create_chat_model(self) -> BaseChatModel:
         """
@@ -302,44 +345,91 @@ class AI:
         """
         if self.azure_endpoint:
             return AzureChatOpenAI(
-                openai_api_base=self.azure_endpoint,
+                azure_endpoint=self.azure_endpoint,
                 openai_api_version=os.getenv("OPENAI_API_VERSION", "2023-05-15"),
                 deployment_name=self.model_name,
                 openai_api_type="azure",
-                streaming=True,
+                streaming=self.streaming,
+                callbacks=[StreamingStdOutCallbackHandler()],
             )
-
-        return ChatOpenAI(
-            model=self.model_name,
-            temperature=self.temperature,
-            streaming=True,
-            client=openai.ChatCompletion,
-        )
+        elif "claude" in self.model_name:
+            return ChatAnthropic(
+                model=self.model_name,
+                temperature=self.temperature,
+                callbacks=[StreamingStdOutCallbackHandler()],
+                streaming=self.streaming,
+                max_tokens_to_sample=4096,
+            )
+        elif self.vision:
+            return ChatOpenAI(
+                model=self.model_name,
+                temperature=self.temperature,
+                streaming=self.streaming,
+                callbacks=[StreamingStdOutCallbackHandler()],
+                max_tokens=4096,  # vision models default to low max token limits
+            )
+        else:
+            return ChatOpenAI(
+                model=self.model_name,
+                temperature=self.temperature,
+                streaming=self.streaming,
+                callbacks=[StreamingStdOutCallbackHandler()],
+            )
 
 
 def serialize_messages(messages: List[Message]) -> str:
-    """
-    Serialize a list of chat messages into a JSON-formatted string.
-
-    This function acts as a wrapper around the `AI.serialize_messages` method,
-    providing a more straightforward access to message serialization.
-
-    Parameters
-    ----------
-    messages : List[Message]
-        A list of chat messages to be serialized. Each message should be an
-        instance of the `Message` type (which includes `AIMessage`, `HumanMessage`,
-        and `SystemMessage`).
-
-    Returns
-    -------
-    str
-        A JSON-formatted string representation of the input messages.
-
-    Example
-    -------
-    >>> msgs = [SystemMessage(content="Hello"), HumanMessage(content="Hi, AI!")]
-    >>> serialize_messages(msgs)
-    '[{"type": "system", "content": "Hello"}, {"type": "human", "content": "Hi, AI!"}]'
-    """
     return AI.serialize_messages(messages)
+
+
+class ClipboardAI(AI):
+    # Ignore not init superclass
+    def __init__(self, **_):  # type: ignore
+        self.vision = False
+        self.token_usage_log = TokenUsageLog("clipboard_llm")
+
+    @staticmethod
+    def serialize_messages(messages: List[Message]) -> str:
+        return "\n\n".join([f"{m.type}:\n{m.content}" for m in messages])
+
+    @staticmethod
+    def multiline_input():
+        print("Enter/Paste your content. Ctrl-D or Ctrl-Z ( windows ) to save it.")
+        content = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            content.append(line)
+        return "\n".join(content)
+
+    def next(
+        self,
+        messages: List[Message],
+        prompt: Optional[str] = None,
+        *,
+        step_name: str,
+    ) -> List[Message]:
+        """
+        Not yet fully supported
+        """
+        if prompt:
+            messages.append(HumanMessage(content=prompt))
+
+        logger.debug(f"Creating a new chat completion: {messages}")
+
+        msgs = self.serialize_messages(messages)
+        pyperclip.copy(msgs)
+        Path("clipboard.txt").write_text(msgs)
+        print(
+            "Messages copied to clipboard and written to clipboard.txt,",
+            len(msgs),
+            "characters in total",
+        )
+
+        response = self.multiline_input()
+
+        messages.append(AIMessage(content=response))
+        logger.debug(f"Chat completion finished: {messages}")
+
+        return messages
